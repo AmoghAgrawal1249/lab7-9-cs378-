@@ -1,0 +1,6 @@
+# Three-node topology in upper-triangle format, as in the assignment.
+# Row A gives costs to B and C; row B gives the cost to C.
+# The final row (C) has no entries and is omitted.
+# A-B = 3, A-C = 1, B-C = 2.
+3	1
+2
