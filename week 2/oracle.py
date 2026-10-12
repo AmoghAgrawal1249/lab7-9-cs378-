@@ -2,134 +2,71 @@ import socket
 import struct
 import sys
 
-TCP_PORT = 5000
-CONNECT = 1
-LINK_STATE = 2
 
-
-def read_exact(sock, size):
-    chunks = bytearray()
-    while len(chunks) < size:
-        chunk = sock.recv(size - len(chunks))
+def read_exact(connection, size):
+    data = b""
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
         if not chunk:
-            raise ConnectionError("peer closed the TCP connection")
-        chunks.extend(chunk)
-    return bytes(chunks)
-
-
-def receive_frame(sock):
-    message_type, body_size = struct.unpack("!BH", read_exact(sock, 3))
-    return message_type, read_exact(sock, body_size)
-
-
-def send_frame(sock, message_type, body):
-    sock.sendall(struct.pack("!BH", message_type, len(body)) + body)
-
-
-def read_topology(path):
-    rows = []
-    with open(path, encoding="utf-8") as config:
-        for line_number, raw in enumerate(config, start=1):
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            try:
-                rows.append([int(value) for value in line.split()])
-            except ValueError as error:
-                raise ValueError(f"line {line_number}: costs must be integers") from error
-
-    if not rows:
-        raise ValueError("configuration needs at least one upper-triangle cost row")
-    node_count = len(rows) + 1
-    if node_count > 26:
-        raise ValueError("configuration supports at most 26 nodes")
-    for row_index, row in enumerate(rows):
-        expected = node_count - row_index - 1
-        if len(row) != expected:
-            raise ValueError(
-                f"row {row_index + 1} must contain {expected} upper-triangle costs"
-            )
-        if any(cost == 0 or cost < -1 for cost in row):
-            raise ValueError("costs must be positive integers or -1 for no link")
-    return rows
-
-
-def neighbourhoods(rows):
-    count = len(rows) + 1
-    costs = [[-1] * count for _ in range(count)]
-    for i in range(count):
-        costs[i][i] = 0
-    for i, row in enumerate(rows):
-        for offset, cost in enumerate(row, start=1):
-            j = i + offset
-            costs[i][j] = costs[j][i] = cost
-    return [
-        [(j, costs[i][j]) for j in range(count) if j == i or costs[i][j] > 0]
-        for i in range(count)
-    ]
+            raise ConnectionError("VN disconnected")
+        data += chunk
+    return data
 
 
 def main():
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <bind-ip> <topology-file>", file=sys.stderr)
-        return 2
+    with open(sys.argv[2]) as config:
+        rows = []
+        for line in config:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                rows.append([int(value) for value in line.split()])
 
-    bind_ip, config_path = sys.argv[1:]
-    rows = read_topology(config_path)
-    node_count = len(rows) + 1
+    count = len(rows) + 1
+    costs = [[0] * count for _ in range(count)]
+    for i, row in enumerate(rows):
+        for j, cost in enumerate(row, start=i + 1):
+            costs[i][j] = costs[j][i] = cost
+
+    connections = []
     peers = []
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((bind_ip, TCP_PORT))
-            listener.listen(node_count)
-            print(f"Oracle listening on {bind_ip}:{TCP_PORT}; expecting {node_count} nodes")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((sys.argv[1], 5000))
+            server.listen(count)
+            print(f"Oracle waiting for {count} nodes", flush=True)
 
-            for index in range(node_count):
-                conn, source = listener.accept()
-                conn.settimeout(30)
-                try:
-                    message_type, body = receive_frame(conn)
-                    if message_type != CONNECT or len(body) != 6:
-                        raise ValueError("expected a 6-byte CONNECT message")
-                    ip_text = socket.inet_ntoa(body[:4])
-                    udp_port = struct.unpack("!H", body[4:])[0]
-                    if udp_port == 0:
-                        raise ValueError("UDP port must be nonzero")
-                    peer = {"id": chr(ord("A") + index), "ip": ip_text,
-                            "port": udp_port, "socket": conn, "source": source}
-                    peers.append(peer)
-                    print(f"Registered {peer['id']} at {ip_text}:{udp_port} (TCP peer {source[0]})")
-                except Exception:
-                    conn.close()
-                    raise
+            for i in range(count):
+                connection, _ = server.accept()
+                connections.append(connection)
+                message_type, size = struct.unpack("!BH", read_exact(connection, 3))
+                if message_type != 1:
+                    raise ValueError("expected CONNECT")
+                ip, port = struct.unpack("!4sH", read_exact(connection, size))
+                peers.append((ip, port))
+                print(f"Registered {chr(65 + i)}: {socket.inet_ntoa(ip)}:{port}", flush=True)
 
-            links = neighbourhoods(rows)
-            for index, peer in enumerate(peers):
-                entries = links[index]
-                body = bytearray([len(entries)])
-                for node_index, cost in entries:
-                    target = peers[node_index]
-                    body.extend(struct.pack("!c4sHi", target["id"].encode("ascii"),
-                                            socket.inet_aton(target["ip"]),
-                                            target["port"], cost))
-                send_frame(peer["socket"], LINK_STATE, bytes(body))
-                rendered = ", ".join(f"{chr(ord('A') + node)}={cost}" for node, cost in entries)
-                print(f"Sent LINK-STATE to {peer['id']}: {rendered}")
+            for i, connection in enumerate(connections):
+                neighbours = []
+                for j in range(count):
+                    if i == j or costs[i][j] > 0:
+                        neighbours.append(j)
 
-            print("All initial neighbourhoods sent. Keep this terminal open during the demo.")
-            input("Press Enter to close the oracle... ")
-    except (OSError, ValueError, ConnectionError, TimeoutError) as error:
-        print(f"Oracle error: {error}", file=sys.stderr)
-        return 1
+                body = bytes([len(neighbours)])
+                for j in neighbours:
+                    ip, port = peers[j]
+                    body += struct.pack("!c4sHi", chr(65 + j).encode(), ip, port, costs[i][j])
+                connection.sendall(struct.pack("!BH", 2, len(body)) + body)
+                print(f"Sent LINK-STATE to {chr(65 + i)}")
     finally:
-        for peer in peers:
-            try:
-                peer["socket"].close()
-            except OSError:
-                pass
-    return 0
+        for connection in connections:
+            connection.close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if len(sys.argv) != 3:
+        sys.exit("Usage: python3 oracle.py <own-ip> <topology-file>")
+    try:
+        main()
+    except (OSError, ValueError, struct.error) as error:
+        sys.exit(f"Oracle error: {error}")
